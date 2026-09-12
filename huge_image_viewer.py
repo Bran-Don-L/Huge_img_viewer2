@@ -16,6 +16,7 @@ from pygame_widgets.slider import Slider
 from pygame_widgets.textbox import TextBox
 from pygame_widgets.toggle import Toggle
 import struct
+from collections import OrderedDict
 
 #this will use pygame to populate a grid which when a square is pressed will cause an image file to be parsed to display the image in that grid area
 #the most complicated part about this is that the image is stored as a flat array so we need to handle everything relating to dimension manually...
@@ -26,6 +27,24 @@ RED = (255, 0, 0)
 BLACK = (0, 0, 0)
 DRKGREY = (160, 160, 160)
 GREY = (100, 100, 100)
+
+
+class TileCache:
+    def __init__(self, maxsize=4):
+        self.maxsize = maxsize
+        self._tiles = OrderedDict()
+
+    def get(self, key):
+        tile = self._tiles.get(key)
+        if tile is not None:
+            self._tiles.move_to_end(key)
+        return tile
+
+    def put(self, key, tile):
+        self._tiles[key] = tile
+        self._tiles.move_to_end(key)
+        while len(self._tiles) > self.maxsize:
+            self._tiles.popitem(last=False)
 
 
 #the grid here will be array backed grid so that in future could become non binary (ex image fail to capture should be red not green or something)
@@ -169,6 +188,7 @@ newgrid.drawbuttons()
 
 with open(imagestringraw, "rb") as f: #using the with open has some good handling benefits... Might also offer some file io reading speed improvements
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    tile_cache = TileCache()
     while not newgrid.done:
         if newgrid.slider.getValue() != 0:
             tilehorioverlap = newgrid.slider.getValue()
@@ -187,35 +207,41 @@ with open(imagestringraw, "rb") as f: #using the with open has some good handlin
             xindex = newgrid.column
             yindex = newgrid.row
 
-            # seek to beginning of valid data
-            findstart = xtiledim * xindex * (1 - tilehorioverlap) + xdim * (int(yindex * ytiledim * (1 - (tilevertoverlap))))  # + xdim*ytiledim*yindex # 25120 = xindex xtiledim #find s tart in top left #xindex * xtiledim
-            mm.seek(int(findstart), 1)
-
-            counter = 1
-            stop = ytiledim
-            data = "".encode()
             timestart = time.time()
-            nextstart = xdim - xtiledim
+            cache_key = (xindex, yindex, xtiledim, ytiledim,
+                         tilehorioverlap, tilevertoverlap)
+            tile_image = tile_cache.get(cache_key)
 
-            #instead of concatenating each row to previous we will create a list of rows and then join the list at the end!!!
-            #this join alternative provides improvements that are orders ofmagnitude faster because python's native concatenate function copies the variable each iteration which is very costly for large strings
-            appendeddata = []
-            #while loop faster than for in range looping... nearly twice as fast idk why
-            while counter < stop:
-                try:
-                    appendeddata.append(mm.read(int(xtiledim))) #this limits our speed not io bound
-                    mm.seek(int(nextstart), 1)
-                    counter = counter + 1
-                except:
-                    break
+            if tile_image is None:
+                # The raw file is row-major. A strided view reads the tile rows
+                # directly, avoiding one Python read/seek pair for every row.
+                findstart = (
+                    int(xtiledim * xindex * (1 - tilehorioverlap))
+                    + xdim * int(yindex * ytiledim * (1 - tilevertoverlap))
+                )
+                available_rows = 1 + (len(mm) - findstart - xtiledim) // xdim
+                row_count = min(ytiledim, max(0, available_rows))
+                if row_count == 0:
+                    raise ValueError("Tile starts outside the raw image")
 
-            data = b''.join(appendeddata)
-            print("finish time: " + str(time.time() - timestart) + " image dimensions: " + str(xtiledim) + "x" + str(ytiledim))
+                tile_array = np.ndarray(
+                    shape=(row_count, xtiledim),
+                    dtype=np.uint8,
+                    buffer=mm,
+                    offset=findstart,
+                    strides=(xdim, 1),
+                ).copy()
+                tile_image = Image.fromarray(tile_array, mode="L").convert("RGBA")
+                tile_cache.put(cache_key, tile_image)
+
+            print("finish time: " + str(time.time() - timestart)
+                  + " image dimensions: " + str(tile_image.width)
+                  + "x" + str(tile_image.height))
 
             timestart = time.time()
 
             #for very large images this is slow but working with pil images is very convenient...
-            newimagedata = Image.frombytes("L", (xtiledim, int(len(data) / xtiledim)),data).convert("RGBA")  # convert chunk from bytes into a PIL image with rgba so it can be easily
+            newimagedata = tile_image.copy()
 
             if newgrid.toggle.getValue() == False:
                 sizenew = (1000, 1000)
@@ -227,14 +253,12 @@ with open(imagestringraw, "rb") as f: #using the with open has some good handlin
 
             #py_image = pygame.image.frombuffer(data, (xtiledim, int(len(data) / xtiledim)), 'P')
             #if you happen to know the image dimesnions you could
-            py_image = pygame.image.frombuffer(newimagedata.tobytes(), newimagedata.size, newimagedata.mode)#newimagedata.tobytes(), newimagedata.size, newimagedata.mode
+            py_image = pygame.image.frombuffer(newimagedata.tobytes(), newimagedata.size, newimagedata.mode)
             imsurface = py_image.convert()
            # plt.pyplot.imshow(py_image)
-            newgrid.screen.blit(py_image, (400, 10))
+            newgrid.screen.blit(imsurface, (400, 10))
             pygame.display.update()
-            mm.seek(0, 0)
             print("Total event finish time: " + str(time.time() - timestartevent))
 
 pygame.quit()
 f.close()
-
